@@ -1,9 +1,14 @@
 data/
 logs/
+images/
+states/
 dumps/
 notebooks/
 .vscode/
+.ipynb_checkpoints/
 __pycache__/
 /model/__pycache__/
-passwod.encrypt
+password.encrypt
 session.token
+device.json
+qq.txt

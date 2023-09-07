@@ -1,6 +1,7 @@
 import os
 import copy
 import sys
+from enum import Enum
 import time
 import types
 import gc
@@ -12,10 +13,10 @@ import translate
 import langid
 
 from model.model_run import RWKV
-from model.utils import TOKENIZER
+from model.utils import TOKENIZER, SAMPLER
+from prompt import User, Scenario, SCENARIOS
 
 import prompt
-from prompt import User
 
 try:
     os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[1]
@@ -32,48 +33,49 @@ os.environ["RWKV_JIT_ON"] = '1'
 # '1' : use CUDA kernel for seq mode (much faster)
 os.environ["RWKV_CUDA_ON"] = '1'
 
-CHAT_LANG = 'English'  # English Chinese
-# CHAT_LANG = 'Chinese'
 SAME_LANG = "PLEASE SELECT TWO DISTINCT LANGUAGES"
 
-tokenizer = TOKENIZER("20B_tokenizer.json")
+MAX_MESSAGE_LEN = 8192
+CHUNK_LEN = 256
 
-DONT_OUTPUT = -999999999
+MAX_GENERATE_LEN = 250
 MAX_REPLY_LEN = 1024
-AVOID_REPEAT = '，。：？！'
-
-MAX_MESSAGE_LEN = 4096
-CHUNK_LEN = 128
 
 args = types.SimpleNamespace()
 
+# tokenizer = TOKENIZER("./model/20B_tokenizer.json")
+tokenizer = TOKENIZER("rwkv_vocab_v20230424")
+
+DONT_OUTPUT = -float('inf')
+END_OF_TEXT = 0
+END_OF_LINE = 11 if tokenizer.is_trie() else 187
+END_OF_LINE_DOUBLE = 261 if tokenizer.is_trie() else 535
+END_OF_ROUND = END_OF_LINE_DOUBLE if tokenizer.is_trie() else END_OF_LINE
+
 # args.strategy = 'cpu fp32'
-# args.strategy = 'cuda fp16'
+args.strategy = 'cuda fp16'
 # args.strategy = 'cuda fp16 *8 -> cpu fp32'
 # args.strategy = 'cuda fp16 *6+'
 # args.strategy = 'cuda fp16 *0+ -> cpu fp32 *1'
 # args.strategy = 'cuda fp16 *32 -> cpu fp32'
 # args.strategy = 'cuda fp16 *20 -> cpu fp32'
-args.strategy = 'cuda fp16i8 *20 -> cuda fp16'
+# args.strategy = 'cuda fp16i8 *16 -> cuda fp16'
 
-# args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-7B-20221115-8047'
-# args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-14B-20230213-8019'
-# args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-14B-20230228-ctx4096-test663'
-# args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-14B-20230313-ctx8192-test1050'
-args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-14B-Instruct-test5-20230329-ctx4096.pth'
-# args.MODEL_NAME = '/root/autodl-tmp/Models/RWKV-4-Pile-7B-EngChn-test5-20230330'
+# args.MODEL_NAME = '/root/autodl-tmp/models/RWKV-4-World-3B-v1-20230619-ctx4096'
+# args.MODEL_NAME = '/root/autodl-tmp/models/RWKV-4-World-7B-v1-20230626-ctx4096'
+args.MODEL_NAME = '/root/autodl-tmp/models/RWKV-4-World-CHNtuned-7B-v1-20230709-ctx4096'
+# args.MODEL_NAME = '/root/autodl-tmp/models/RWKV-4-Raven-14B-v12-Eng98%-Other2%-20230523-ctx8192'
+# args.MODEL_NAME = '/root/autodl-tmp/models/RWKV-4-Raven-7B-v11-Eng49%-Chn49%-Jpn1%-Other1%-20230430-ctx8192'
 
-args.STATE_DUMP_NAME = './state_14b'
+args.STATE_DUMP_NAME = 'states/14b.state'
+# args.STATE_DUMP_NAME = 'states/7b.state'
 
-args.vocab_size = 50277
-args.head_qk = 0
-args.pre_ffn = 0
-args.grad_cp = 0
-args.my_pos_emb = 0
 
-args.n_layer = 40   # 32
-args.n_embd = 5120  # 4096
-args.ctx_len = 4096
+class GenerateMode(Enum):
+    GENERATE = 0
+    INSTRUCT = 1
+    RETRY = 2
+    MORE = 3
 
 
 # Load Model
@@ -82,168 +84,123 @@ print(f"Loading... {args.MODEL_NAME}")
 model = RWKV(model=args.MODEL_NAME, strategy=args.strategy)
 
 
-model_tokens = []
-model_state = None
-
-
-AVOID_REPEAT_TOKENS = []
-for i in AVOID_REPEAT:
-    dd = tokenizer.encode(i)
-    assert len(dd) == 1
-    AVOID_REPEAT_TOKENS += dd
-
-
-def run_rnn(tokens, end_bias=DONT_OUTPUT, nl_bias=0):
-    global model_tokens, model_state
-
+def run_rnn(tokens, model_state=None):
     tokens = [int(x) for x in tokens]
-    model_tokens += tokens
 
     while len(tokens) > 0:
         out, model_state = model.forward(tokens[:CHUNK_LEN], model_state)
         tokens = tokens[CHUNK_LEN:]
 
-    out[0] += end_bias
-    out[187] += nl_bias
+    return out, model_state
 
-    return out
+
+def state_to_cuda(state):
+    if state:
+        for i in range(model.args.n_layer):
+            dd = model.strategy[i]
+            dev = dd.device
+            state[i*5+0] = state[i*5+0].to(dev)
+            state[i*5+1] = state[i*5+1].to(dev)
+            state[i*5+2] = state[i*5+2].to(dev)
+            state[i*5+3] = state[i*5+3].to(dev)
+            state[i*5+4] = state[i*5+4].to(dev)
+
+
+def state_to_cpu(state):
+    if state:
+        for i in range(model.args.n_layer):
+            state[i*5+0] = state[i*5+0].cpu()
+            state[i*5+1] = state[i*5+1].cpu()
+            state[i*5+2] = state[i*5+2].cpu()
+            state[i*5+3] = state[i*5+3].cpu()
+            state[i*5+4] = state[i*5+4].cpu()
 
 
 all_state = {}
 
 
 def clean_user_state(uid, channel):
-    global all_state
     n = f'{uid}_{channel}'
     if n in all_state.keys():
         del all_state[n]
 
 
-def save_all_state(uid, channel, last_out):
-    global all_state
+def save_all_state(uid, channel, last_out, model_state, model_tokens):
     n = f'{uid}_{channel}'
     all_state[n] = {}
     all_state[n]['out'] = last_out
-    all_state[n]['rnn'] = copy.deepcopy(model_state)
+    all_state[n]['state'] = copy.deepcopy(model_state)
     all_state[n]['token'] = copy.deepcopy(model_tokens)
+    state_to_cpu(all_state[n]['state'])
 
 
 def load_all_state(uid, channel):
-    global all_state, model_tokens, model_state
-    clear_current_state()
-
     n = f'{uid}_{channel}'
-    model_state = copy.deepcopy(all_state[n]['rnn'])
+    model_state = copy.deepcopy(all_state[n]['state'])
     model_tokens = copy.deepcopy(all_state[n]['token'])
 
-    if model_state is not None:
-        for i in range(args.n_layer):
-            dd = model.strategy[i]
-            dev = dd.device
-            atype = dd.atype
-            model_state[i*5+0] = model_state[i*5+0].to(atype).to(dev)
-            model_state[i*5+1] = model_state[i*5+1].to(torch.float).to(dev)
-            model_state[i*5+2] = model_state[i*5+2].to(torch.float).to(dev)
-            model_state[i*5+3] = model_state[i*5+3].to(torch.float).to(dev)
-            model_state[i*5+4] = model_state[i*5+4].to(atype).to(dev)
-
-    return all_state[n]['out']
+    state_to_cuda(model_state)
+    return all_state[n]['out'], model_state, model_tokens
 
 
-def save_active_mode(uid, channel, mode):
-    global all_state
-    n = f'{uid}_{channel}_mode'
-    all_state[n] = mode
+def save_params(uid, channel, **kwargs):
+    n = f'params_{uid}_{channel}'
+    all_state[n] = kwargs
 
 
-def load_active_mode(uid, channel):
-    n = f'{uid}_{channel}_mode'
-    try:
-        mode = all_state[n]
-    except:
-        mode = ""
-    return mode
+def load_params(uid, channel):
+    n = f'params_{uid}_{channel}'
+    return all_state[n]
 
 
-def clear_current_state():
-    global model_tokens, model_state
-    model_tokens = []
-    model_state = None
+def clear_cache():
     gc.collect()
     torch.cuda.empty_cache()
 
 
+def fix_tokens_end_line(tokens):
+    if not tokenizer.is_trie() and tokens and tokens[-1] == END_OF_LINE_DOUBLE:
+        tokens = tokens[:-1] + [END_OF_LINE, END_OF_LINE]
+    return tokens
+
+
+def fix_tokens_end_text(tokens):
+    fixed_tokens = [END_OF_LINE_DOUBLE] if tokenizer.is_trie() else \
+        [END_OF_LINE, END_OF_LINE]
+    if tokens and tokens[-1] == END_OF_TEXT:
+        tokens = tokens[:-1] + fixed_tokens
+    return tokens
+
+
 def init_run():
-    try:
-        recover_all_state()
-        print("Recovered state")
-    except:
-        print("Loading chat intro...")
-        clear_current_state()
-        out = run_rnn(tokenizer.encode(prompt.default_user.chat_intro()))
-        save_all_state("", "chat_intro", out)
+    # try:
+    #     recover_all_state()
+    #     print("Recovered state")
+    # except:
+    for scenario in SCENARIOS.data:
+        print(f"Loading chat intro {scenario.name}...")
+        tokens = tokenizer.encode(scenario.chat_intro())
+        tokens = fix_tokens_end_line(tokens)
+        out, state = run_rnn(tokens)
+        save_all_state("", scenario.name, out, state, tokens)
 
-        print("Loading Chinese chat intro...")
-        clear_current_state()
-        out = run_rnn(tokenizer.encode(prompt.default_user.chat_intro_cn()))
-        save_all_state("", "chat_intro_cn", out)
-
-        print("Loading instruct intro...")
-        clear_current_state()
-        out = run_rnn(tokenizer.encode(prompt.default_user.instruct_intro()))
-        save_all_state("", "instruct_intro", out)
-
-        dump_all_state()
+    clear_cache()
+    # dump_all_state()
 
 
 def recover_all_state():
     global all_state
-    with open(args.STATE_DUMP_NAME + '.pickle', 'rb') as file:
+    with open(args.STATE_DUMP_NAME, 'rb') as file:
         all_state = pickle.load(file)
 
 
 def dump_all_state():
-    with open(args.STATE_DUMP_NAME + '.pickle', 'wb') as file:
+    with open(args.STATE_DUMP_NAME, 'wb') as file:
         pickle.dump(all_state, file, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def clamp(n, minimum, maximum):
     return max(minimum, min(n, maximum))
-
-
-def read_sampler_params(message: str, temp=1.0, top_p=0.8, af=0.5, ap=0.2):
-    x_temp = temp
-    x_top_p = top_p
-    x_af = af
-    x_ap = ap
-
-    temp_match = re.search("(\-temp\s*=\s*)([^\s]+)\s+", message)
-    top_p_match = re.search("(\-top_p\s*=\s*)([^\s]+)\s+", message)
-    af_match = re.search("(\-af\s*=\s*)([^\s]+)\s+", message)
-    ap_match = re.search("(\-ap\s*=\s*)([^\s]+)\s+", message)
-
-    if temp_match is not None:
-        x_temp = float(temp_match.group(2))
-        message = message.replace(temp_match.group(0), "")
-        print(f"temp: {x_temp}")
-    if top_p_match is not None:
-        x_top_p = float(top_p_match.group(2))
-        message = message.replace(top_p_match.group(0), "")
-        print(f"top_p: {x_top_p}")
-    if af_match is not None:
-        x_af = float(af_match.group(2))
-        message = message.replace(af_match.group(0), "")
-        print(f"af: {x_af}")
-    if ap_match is not None:
-        x_ap = float(ap_match.group(2))
-        message = message.replace(ap_match.group(0), "")
-        print(f"ap: {x_ap}")
-
-    x_temp = clamp(x_temp, 0.2, 5)
-    x_top_p = max(0, x_top_p)
-    x_af = clamp(x_af, 0.0, 1.0)
-    x_ap = clamp(x_ap, 0.0, 1.0)
-    return message, x_temp, x_top_p, x_af, x_ap
 
 
 def translate_message(message, from_lang, to_lang):
@@ -256,13 +213,34 @@ def translate_message(message, from_lang, to_lang):
     return translated
 
 
-def on_reset(user: User) -> str:
-    # out = load_all_state("", f"")
-    # save_all_state(user.id, "chat", out)
-    clean_user_state(user.id, "chat")
+def on_reset(user: User, message: str) -> str:
+    scenario = copy.deepcopy(SCENARIOS.default)
+    key = copy.deepcopy(message)
+    key = scenario.sampler.parse(key)
+    scenario = copy.deepcopy(SCENARIOS.search(key.strip()))
+    message = scenario.sampler.parse(message)
 
-    reply = f"Chat reset for {user.nickname}."
-    return reply
+    out, model_state, model_tokens = load_all_state('', scenario.name)
+    save_all_state(user.id, "chat", out, model_state, model_tokens)
+    save_params(user.id, "chat", scenario=scenario)
+
+    return f"Chat reset for {user.nickname}. Scenario {scenario.name}. You are {scenario.user_name} and I am {scenario.bot_name}."
+
+
+def on_show_params(user: User, message: str, prompts=False) -> str:
+    try:
+        params = load_params(user.id, "chat")
+        scenario: Scenario = params['scenario']
+        message = scenario.sampler.parse(message)
+        save_params(user.id, "chat", scenario=scenario)
+    except:
+        scenario = copy.deepcopy(SCENARIOS.default)
+        save_params(user.id, "chat", scenario=scenario)
+
+    if prompts:
+        return scenario.chat_intro()
+    else:
+        return str(scenario)
 
 
 def on_translate(user: User, message: str) -> str:
@@ -279,156 +257,194 @@ def on_translate(user: User, message: str) -> str:
     return reply
 
 
-def on_generate(user: User, message: str, mode: str = "") -> str:
-    global model_tokens, model_state
-
+def on_generate(user: User, message: str, mode=GenerateMode.GENERATE) -> str:
     message = message.replace("\r\n", '\n').replace('\\n', '\n').strip()
     if len(message) > MAX_MESSAGE_LEN:
         return f"Your message is too long! (max {MAX_MESSAGE_LEN} tokens)"
-    print(message)
-
-    if mode != "retry" and mode != "more":
-        save_active_mode(user.id, "gen", mode)
-
-    x_temp = 1.0
-    x_top_p = 0.8
-    x_af = 0.5
-    x_ap = 0.2
-    if mode == "inst":
-        x_temp = 0.8
-        x_top_p = 0.5
-        x_af = 0.1
-        x_ap = 0.1
-
-    message, x_temp, x_top_p, x_af, x_ap = read_sampler_params(
-        message, x_temp, x_top_p, x_af, x_ap)
+    print(f"{user.nickname}({user.id}): {message}")
 
     reply: str = ""
 
-    if mode == "retry":
-        try:
-            out = load_all_state(user.id, "gen_0")
-        except:
-            return reply
-    elif mode == "more":
-        try:
-            out = load_all_state(user.id, "gen_1")
-            save_all_state(user.id, "gen_0", out)
-        except:
-            return reply
-    elif mode == "qa":
-        clear_current_state()
-        next = user.qa_format(message)
-        out = run_rnn(tokenizer.encode(next))
-        save_all_state(user.id, "gen_0", out)
-    elif mode == "inst":
-        clear_current_state()
-        out = load_all_state("", f"instruct_intro")
-        next = user.instruct_format(message)
-        out = run_rnn(tokenizer.encode(next))
-        save_all_state(user.id, "gen_0", out)
+    if mode not in [GenerateMode.RETRY, GenerateMode.MORE]:
+        if mode == GenerateMode.GENERATE:
+            sampler = copy.deepcopy(prompt.CHAT_SAMPLER)
+        elif mode == GenerateMode.INSTRUCT:
+            sampler = copy.deepcopy(prompt.INSTRUCT_SAMPLER)
+
+        message = sampler.parse(message)
+        active_mode = mode
+        save_params(user.id, "gen", mode=mode, sampler=sampler)
     else:
-        clear_current_state()
-        next = '\n' + message.strip()
-        out = run_rnn(tokenizer.encode(next))
-        save_all_state(user.id, "gen_0", out)
+        try:
+            params = load_params(user.id, "gen")
+            sampler: SAMPLER = params['sampler']
+            active_mode = params['mode']
 
-    active_mode = load_active_mode(user.id, "gen")
-    counter = torch.zeros_like(out, device=out.device)
-    begin = len(model_tokens)
-    out_last = begin
+            message = sampler.parse(message)
+            save_params(user.id, "gen", mode=active_mode, sampler=sampler)
+        except Exception as e:
+            print(e)
+            return reply
+
+    print(str(sampler))
+
+    if mode == GenerateMode.RETRY:
+        try:
+            out, model_state, model_tokens = load_all_state(user.id, "gen_0")
+        except:
+            return reply
+    elif mode == GenerateMode.MORE:
+        try:
+            out, model_state, model_tokens = load_all_state(user.id, "gen_1")
+            save_all_state(user.id, "gen_0", out, model_state, model_tokens)
+        except:
+            return reply
+    elif mode == GenerateMode.INSTRUCT:
+        message = prompt.instruct_format(message)
+        model_tokens = tokenizer.encode(message)
+        out, model_state = run_rnn(model_tokens)
+        save_all_state(user.id, "gen_0", out, model_state, model_tokens)
+    else:
+        message = '\n' + message.strip()
+        model_tokens = tokenizer.encode(message)
+        out, model_state = run_rnn(model_tokens)
+        save_all_state(user.id, "gen_0", out, model_state, model_tokens)
+
     start_time = time.time()
-    for i in range(150):
-        out = tokenizer.alpha_logits(out, counter, x_af, x_ap)
-        token = tokenizer.sample_logits(out, x_temp, x_top_p)
-        out = run_rnn([token])
-        counter[int(token)] += 1
 
-        xxx = tokenizer.decode(model_tokens[out_last:])
+    begin = len(model_tokens)
+    end = begin
+    for i in range(MAX_GENERATE_LEN):
+        if active_mode == GenerateMode.GENERATE:
+            out[0] = DONT_OUTPUT
+
+        occurrence = {}
+        for token in model_tokens[max(begin, end - sampler.penalty_range):]:
+            if token in [END_OF_LINE]:
+                continue
+            if token not in occurrence:
+                occurrence[token] = 1
+            else:
+                occurrence[token] += 1
+
+        for n in occurrence:
+            out[n] -= sampler.presence_penalty + \
+                occurrence[n] * sampler.count_penalty
+
+        token = sampler.sample(out)
+        if token != END_OF_TEXT:
+            model_tokens += [token]
+        out, model_state = run_rnn([token], model_state)
+
+        xxx = tokenizer.decode(model_tokens[end:])
         if '\ufffd' not in xxx:
             print(xxx, end='', flush=True)
-            out_last = begin + i + 1
+            end = begin + i + 1
 
         reply = tokenizer.decode(model_tokens[begin:])
         reply = reply.replace("\r\n", '\n').replace('\\n', '\n')
 
-        if active_mode == "qa" and '\n\n' in reply:
-            break
-        elif active_mode == "inst" and "\n---\n" in reply:
-            reply = reply[:-len("\n---\n")]
+        if token == END_OF_TEXT:
             break
 
     end_time = time.time()
     delta_time = end_time - start_time
-    print(f"\nTokens: {out_last - begin}\nTime: {delta_time}")
+    print(f"\nTokens: {end - begin}\nTime: {delta_time}")
 
-    gc.collect()
-    torch.cuda.empty_cache()
-    save_all_state(user.id, "gen_1", out)
+    clear_cache()
+    save_all_state(user.id, "gen_1", out, model_state, model_tokens)
 
     reply = reply.strip()
     return reply
 
 
-def on_message(user: User, message: str, alt: bool = False) -> str:
-    global model_tokens, model_state
-
+def on_message(user: User, message: str, alt=False) -> str:
     message = message.replace('\r\n', '\n').replace('\\n', '\n').strip()
+    message = re.sub("\n(\s*\n)+", '\n', message)
+
     if len(message) > MAX_MESSAGE_LEN:
         return f"Your message is too long! (max {MAX_MESSAGE_LEN} tokens)"
-    print(message)
+    if not alt and len(message) == 0:
+        return ""
+    print(f"{user.nickname}({user.id}): {message}")
 
-    message, x_temp, x_top_p, x_af, x_ap = read_sampler_params(message)
+    # lang = langid.classify(message)[0]
     reply: str = ""
 
-    lang = langid.classify(message)[0]
-    default_intro = "chat_intro_cn" if 'zh' in lang else "chat_intro"
-    # message = translate_message(message, lang, "en")
+    try:
+        channel = "chat_pre" if alt else "chat"
+        out, model_state, model_tokens = load_all_state(user.id, channel)
 
-    if not alt:
-        try:
-            out = load_all_state(user.id, "chat")
-        except:
-            out = load_all_state("", default_intro)
-            save_all_state(user.id, "chat", out)
-            print(f"Loaded chat intro {default_intro}")
-        next = user.chat_format(message)
-
-        out = run_rnn(tokenizer.encode(next), nl_bias=DONT_OUTPUT)
-        save_all_state(user.id, "chat_previous", out)
-    else:
-        try:
-            out = load_all_state(user.id, "chat_previous")
-        except:
+        params = load_params(user.id, "chat")
+        scenario: Scenario = params['scenario']
+        sampler: SAMPLER = scenario.sampler
+        message = sampler.parse(message)
+        save_params(user.id, "chat", scenario=scenario)
+    except:
+        if alt:
             return reply
 
-    counter = torch.zeros_like(out, device=out.device)
+        scenario: Scenario = copy.deepcopy(SCENARIOS.default)
+        sampler: SAMPLER = scenario.sampler
+        message = sampler.parse(message)
+
+        out, model_state, model_tokens = load_all_state('', scenario.name)
+
+        save_all_state(user.id, "chat", out, model_state, model_tokens)
+        save_params(user.id, "chat", scenario=scenario)
+
+    print(str(sampler))
+    print(f"{scenario.bot_name}{scenario.interface}", end='')
+
+    if not alt:
+        message = scenario.chat_format(message)
+        tokens = tokenizer.encode(message)
+
+        model_tokens += tokens
+        out, model_state = run_rnn(tokens, model_state)
+
+        save_all_state(
+            user.id,
+            "chat_pre",
+            out,
+            model_state,
+            model_tokens)
+
     begin = len(model_tokens)
-    out_last = begin
+    end = begin
     for i in range(MAX_REPLY_LEN):
         if i <= 0:
             nl_bias = DONT_OUTPUT
         elif i <= 30:
             nl_bias = (i - 30) * 0.1
-        elif i <= 130:
-            nl_bias = 0
         else:
-            nl_bias = (i - 130) * 0.25
+            nl_bias = 0
+        # else:
+        #     nl_bias = (i - 300) * 0.25
+        out[END_OF_ROUND] += nl_bias
 
-        out = tokenizer.alpha_logits(out, counter, x_af, x_ap)
-        token = tokenizer.sample_logits(out, x_temp, x_top_p)
+        occurrence = {}
+        for token in model_tokens[max(begin, end - sampler.penalty_range):]:
+            if token in [END_OF_LINE]:
+                continue
+            if token not in occurrence:
+                occurrence[token] = 1
+            else:
+                occurrence[token] += 1
 
-        next_tokens = [token]
-        if token == 0:
-            next_tokens = tokenizer.encode('\n\n')
+        for n in occurrence:
+            out[n] -= sampler.presence_penalty + \
+                occurrence[n] * sampler.count_penalty
 
-        out = run_rnn(next_tokens, end_bias=0, nl_bias=nl_bias)
-        counter[int(token)] += 1
+        token = sampler.sample(out)
+        tokens = fix_tokens_end_text([token])
+        model_tokens += tokens
+        out, model_state = run_rnn(tokens, model_state)
 
-        xxx = tokenizer.decode(model_tokens[out_last:])
+        xxx = tokenizer.decode(model_tokens[end:])
         if '\ufffd' not in xxx:
             print(xxx, end='', flush=True)
-            out_last = begin + i + 1
+            end = begin + i + 1
 
         reply = tokenizer.decode(model_tokens[begin:])
         reply = reply.replace("\r\n", '\n').replace('\\n', '\n')
@@ -436,13 +452,49 @@ def on_message(user: User, message: str, alt: bool = False) -> str:
         if '\n\n' in reply:
             break
 
-    gc.collect()
-    torch.cuda.empty_cache()
-    save_all_state(user.id, "chat", out)
+        # State recovery
+        def recover_state(forbidden: str, reply: str, out, model_state, model_tokens):
+            idx = reply.find(forbidden)
+            if idx < 0:
+                return idx, reply, out, model_state, model_tokens
 
-    reply = reply.replace(user.name, user.nickname)
-    reply = reply.replace(user.name.lower(), user.nickname)
-    reply = reply.replace(user.name.upper(), user.nickname)
+            reply = f" {reply[:idx].strip()}\n\n"
+            tokens = tokenizer.encode(reply)
+            tokens = fix_tokens_end_line(tokens)
+            out, model_state, model_tokens = \
+                load_all_state(user.id, "chat_pre")
+
+            model_tokens += tokens
+            out, model_state = run_rnn(tokens, model_state)
+
+            return idx, reply, out, model_state, model_tokens
+
+        idx, reply, out, model_state, model_tokens = recover_state(
+            f"{scenario.user_name}{scenario.interface}",
+            reply,
+            out,
+            model_state,
+            model_tokens)
+        if idx >= 0:
+            print(f"\nRecovered: {tokenizer.decode(model_tokens[begin:])}")
+            break
+
+        idx, reply, out, model_state, model_tokens = recover_state(
+            f"{scenario.bot_name}{scenario.interface}",
+            reply,
+            out,
+            model_state,
+            model_tokens)
+        if idx >= 0:
+            print(f"\nRecovered: {tokenizer.decode(model_tokens[begin:])}")
+            break
+
+    clear_cache()
+    save_all_state(user.id, "chat", out, model_state, model_tokens)
+
+    reply = reply.replace(scenario.user_name, user.nickname)
+    reply = reply.replace(scenario.user_name.lower(), user.nickname)
+    reply = reply.replace(scenario.user_name.upper(), user.nickname)
     reply = reply.strip()
     # reply = translate_message(reply, "en", lang)
     return reply
